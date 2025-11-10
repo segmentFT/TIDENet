@@ -1,7 +1,3 @@
-<style>
-    .img-center { text-align: center }
-</style>
-
 # TIDENet
 
 This is a PyTorch implementation for the AAAI'25 paper "Trainable EEG Interpolation and Structure-Sharing Dual-Path Encoders for Brain-Assisted Target Speaker Extraction"
