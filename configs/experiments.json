@@ -1,0 +1,6 @@
+{
+  "test": {
+    "model_path": "exp/BASEN/checkpoint/",
+    "dataset_root": ""
+  }
+}

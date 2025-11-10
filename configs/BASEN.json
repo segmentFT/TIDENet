@@ -1,0 +1,42 @@
+{   
+    "network_config": {
+        "num_electrodes": 128,
+        "k_adj": 3,
+        "enc_channel": 128,
+        "feature_channel": 64,
+        "kernel_size": 8,
+        "num_layers": 4,
+        "rnn_type": "LSTM" ,
+        "norm": "ln",
+        "K": 250,
+        "dropout_rate": 0.1,
+        "bidirectional": true,
+        "CMCA_kernel": 3,
+        "CMCA_layer_num": 3,
+        "CMCA_n_head": 1
+    },
+    "train_config": {
+        "exp_path": "BASEN",
+        "log":{
+            "directory": "./exp",
+            "ckpt_iter": "max",
+            "iters_per_ckpt": 500
+        },
+        "optimization":{
+            "epochs": 400,
+            "learning_rate": 3.5e-4,
+            "batch_size_per_gpu": 8,
+            "n_iter_per_cycle": 2000
+        }
+    },
+    "trainset_config": {
+        "root": ""
+    },
+    "gen_config":{
+        "output_directory": "./exp"
+    },
+    "dist_config": {
+        "dist_backend": "nccl",
+        "dist_url": "tcp://localhost:22871"
+    }
+}
