@@ -90,8 +90,8 @@ if __name__ == "__main__":
     print_size(net.DPRNN)
     print_size(net.DPRNN.fusion)
     print_size(net.DPRNN.fusion.projection)
-    print_size(net.DPRNN.fusion.audio_encoder)
-    print_size(net.DPRNN.fusion.spike_encoder)
-    print_size(net.DPRNN.fusion.audio_encoder[0])
-    print_size(net.DPRNN.fusion.audio_encoder[0].w_qs)
+    print_size(net.DPRNN.fusion.voice_attns)
+    print_size(net.DPRNN.fusion.EEG_attns)
+    print_size(net.DPRNN.fusion.voice_attns[0])
+    print_size(net.DPRNN.fusion.voice_attns[0].w_qs)
     

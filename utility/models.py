@@ -4,401 +4,268 @@ import torch.nn as nn
 from utility.layers import GraphConvolution
 from utility.utils import normalize_A, generate_cheby_adj, ChannelwiseLayerNorm, ResBlock
 
+
+def _padding(input, K):
+    '''
+    padding the audio times
+    K: chunks of length
+    P: hop size
+    input: [B, N, L]
+    '''
+    B, N, L = input.shape
+    P = K // 2
+    gap = K - (P + L % K) % K
+    if gap > 0:
+        pad = torch.Tensor(torch.zeros(B, N, gap)).type(input.type())
+        input = torch.cat([input, pad], dim=2)
+
+    _pad = torch.Tensor(torch.zeros(B, N, P)).type(input.type())
+    input = torch.cat([_pad, input, _pad], dim=2)
+
+    return input, gap
+
+def _Segmentation(input, K):
+    '''
+        the segmentation stage splits
+        K: chunks of length
+        P: hop size
+        input: [B, N, L]
+        output: [B, N, K, S]
+    '''
+    B, N, L = input.shape
+    P = K // 2
+    input, gap = _padding(input, K)
+    # [B, N, K, S]
+    input1 = input[:, :, :-P].contiguous().view(B, N, -1, K)
+    input2 = input[:, :, P:].contiguous().view(B, N, -1, K)
+    input = torch.cat([input1, input2], dim=3).view(B, N, -1, K).transpose(2, 3)
+
+    return input.contiguous(), gap\
+    
+def _over_add(input, gap):
+    '''
+        Merge sequence
+        input: [B, N, K, S]
+        gap: padding length
+        output: [B, N, L]
+    '''
+    B, N, K, S = input.shape
+    P = K // 2
+    # [B, N, S, K]
+    input = input.transpose(2, 3).contiguous().view(B, N, -1, K * 2)
+
+    input1 = input[:, :, :, :K].contiguous().view(B, N, -1)[:, :, P:]
+    input2 = input[:, :, :, K:].contiguous().view(B, N, -1)[:, :, :-P]
+    input = input1 + input2
+    # [B, N, L]
+    if gap > 0:
+        input = input[:, :, :-gap]
+
+    return input
+
+
 class DepthConv1d(nn.Module):
 
-    def __init__(self, input_channel, hidden_channel, kernel, padding, dilation=1, skip=True):
+    def __init__(self, out_channels, hidden_channels):
         super(DepthConv1d, self).__init__()
 
-        self.skip = skip
-        
-        self.conv1d = nn.Conv1d(input_channel, hidden_channel, 1)
-        self.padding = padding
-        self.dconv1d = nn.Conv1d(hidden_channel, hidden_channel, kernel, dilation=dilation,
-          groups=hidden_channel,
-          padding=self.padding)
-        self.res_out = nn.Conv1d(hidden_channel, input_channel, 1)
-        self.nonlinearity1 = nn.PReLU()
-        self.nonlinearity2 = nn.PReLU()
-
-        self.reg1 = nn.GroupNorm(1, hidden_channel, eps=1e-08)
-        self.reg2 = nn.GroupNorm(1, hidden_channel, eps=1e-08)
-        if self.skip:
-            self.skip_out = nn.Conv1d(hidden_channel, input_channel, 1)
-
-    def forward(self, input):
-        output = self.reg1(self.nonlinearity1(self.conv1d(input)))
-
-
-        output = self.reg2(self.nonlinearity2(self.dconv1d(output)))
-        residual = self.res_out(output)
-        if self.skip:
-            skip = self.skip_out(output)
-            return residual, skip
-        else:
-            return residual
-        
-
-class GlobalLayerNorm(nn.Module):
-    def __init__(self, dim, shape, eps=1e-8, elementwise_affine=True):
-        super(GlobalLayerNorm, self).__init__()
-        self.dim = dim
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-
-        if self.elementwise_affine:
-            if shape == 3:
-                self.weight = nn.Parameter(torch.ones(self.dim, 1))
-                self.bias = nn.Parameter(torch.zeros(self.dim, 1))
-            if shape == 4:
-                self.weight = nn.Parameter(torch.ones(self.dim, 1, 1))
-                self.bias = nn.Parameter(torch.zeros(self.dim, 1, 1))
-        else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
+        self.operations = nn.Sequential(
+            nn.Conv1d(out_channels, hidden_channels, 1),
+            nn.PReLU(),
+            nn.GroupNorm(1, hidden_channels, 1e-8),
+            nn.Conv1d(hidden_channels, hidden_channels, 3, padding=1, groups=hidden_channels),
+            nn.PReLU(),
+            nn.GroupNorm(1, hidden_channels, 1e-8),
+            nn.Conv1d(hidden_channels, out_channels, 1)
+        )
 
     def forward(self, x):
-        # x = N x C x K x S or N x C x L
-        # N x 1 x 1
-        # cln: mean,var N x 1 x K x S
-        # gln: mean,var N x 1 x 1
-        if x.dim() == 4:
-            mean = torch.mean(x, (1, 2, 3), keepdim=True)
-            var = torch.mean((x-mean)**2, (1, 2, 3), keepdim=True)
-            if self.elementwise_affine:
-                x = self.weight*(x-mean)/torch.sqrt(var+self.eps)+self.bias
-            else:
-                x = (x-mean)/torch.sqrt(var+self.eps)
-        if x.dim() == 3:
-            mean = torch.mean(x, (1, 2), keepdim=True)
-            var = torch.mean((x-mean)**2, (1, 2), keepdim=True)
-            if self.elementwise_affine:
-                x = self.weight*(x-mean)/torch.sqrt(var+self.eps)+self.bias
-            else:
-                x = (x-mean)/torch.sqrt(var+self.eps)
-        return x
-
-class CumulativeLayerNorm(nn.LayerNorm):
-    '''
-       Calculate Cumulative Layer Normalization
-       dim: you want to norm dim
-       elementwise_affine: learnable per-element affine parameters 
-    '''
-
-    def __init__(self, dim, elementwise_affine=True):
-        super(CumulativeLayerNorm, self).__init__(
-            dim, elementwise_affine=elementwise_affine, eps=1e-8)
-
-    def forward(self, x):
-        # x: N x C x K x S or N x C x L
-        # N x K x S x C
-        if x.dim() == 4:
-           x = x.permute(0, 2, 3, 1).contiguous()
-           # N x K x S x C == only channel norm
-           x = super().forward(x)
-           # N x C x K x S
-           x = x.permute(0, 3, 1, 2).contiguous()
-        if x.dim() == 3:
-            x = torch.transpose(x, 1, 2)
-            # N x L x C == only channel norm
-            x = super().forward(x)
-            # N x C x L
-            x = torch.transpose(x, 1, 2)
-        return x
-
-
-def select_norm(norm, dim, shape):
-    if norm == 'gln':
-        return GlobalLayerNorm(dim, shape, elementwise_affine=True)
-    if norm == 'cln':
-        return CumulativeLayerNorm(dim, elementwise_affine=True)
-    if norm == 'ln':
-        return nn.GroupNorm(1, dim, eps=1e-8)
-    else:
-        return nn.BatchNorm1d(dim)
-
+        # x: [B, C, T]
+        
+        return self.operations(x)
+        
 
 class ConvCrossAttention(nn.Module):
-    def __init__(self, n_head, in_channels, kernel_size, dilation, dropout=0.1):
+    def __init__(self, out_channels):
         super(ConvCrossAttention, self).__init__()
 
-        self.n_head = n_head
+        self.to_q = DepthConv1d(out_channels, out_channels*2)
+        self.to_k = DepthConv1d(out_channels, out_channels*2)
+        self.to_v = DepthConv1d(out_channels, out_channels*2)
+        self.norm = nn.GroupNorm(1, out_channels, 1e-8)
 
-        self.w_qs = DepthConv1d(in_channels, in_channels * 2, kernel_size, 
-                                "same", dilation, False)
-        self.w_ks = DepthConv1d(in_channels, in_channels * 2, kernel_size, 
-                                "same", dilation, False)
-        self.w_vs = DepthConv1d(in_channels, in_channels * 2, kernel_size, 
-                                "same", dilation, False)
+    def forward(self, x, y):
+        # x: [B, C, T]
+        # y: [B, C, T]
 
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.GroupNorm(1, in_channels, eps=1e-08)
-
-
-    def forward(self, q, k, v):
+        q = self.to_q(x)
         # q: [B, C, T]
+        k = self.to_k(y)
         # k: [B, C, T]
+        v = self.to_v(y)
         # v: [B, C, T]
 
-        d_q, d_k, d_v = q.size(2), k.size(2), v.size(2)
-        len_q, len_k, len_v = q.size(1), k.size(1), v.size(1)
-        sz_b = q.size(0)
-
-        residual = v
-
-        q = self.w_qs(q)
-        # q: [B, C, T]
-        k = self.w_ks(k)
-        # k: [B, C, T]
-        v = self.w_vs(v)
-        # v: [B, C, T]
-
-        q = q.view(sz_b, len_q, self.n_head, d_q // self.n_head)
-        # q: [B, C, H, T / H]
-        k = k.view(sz_b, len_k, self.n_head, d_k // self.n_head)
-        # k: [B, C, H, T / H]
-        v = v.view(sz_b, len_v, self.n_head, d_v // self.n_head)
-        # v: [B, C, H, T / H]
-
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        # q: [B, H, C, T / H]
-        # k: [B, H, C, T / H]
-        # v: [B, H, C, T / H]
-
-        attn = torch.matmul(q / (d_k ** 0.5), k.transpose(2, 3))
-        attn = self.dropout(torch.softmax(attn, -1))
-        # attn: [B, H, C, C]
+        k = torch.transpose(k, -2, -1)
+        # k: [B, T, C]
+        p_attn = torch.matmul(q, k) / math.sqrt(k.size(1))
+        # p_attn: [B, C, C]
+        attn = torch.dropout(p_attn.softmax(-1), 0.1, self.training)
+        # attn:  [B, C, C]
         output = torch.matmul(attn, v)
-        # output: [B, H, C, T / H]
-
-        output = output.transpose(1, 2)
-        # output: [B, C, H, T / H]
-        output = output.reshape(sz_b, len_v, -1)
         # output: [B, C, T]
-        output = output + residual
 
-        output = self.layer_norm(output)
-
-        return output
+        return self.norm(output + y)
 
 class MultiLayerCrossAttention(nn.Module):
-    def __init__(self, num_layers, in_channels, kernel_size, dilation, n_head=1):
+    def __init__(self, num_layers, out_channels):
         super(MultiLayerCrossAttention, self).__init__()
 
         self.num_layers = num_layers
 
-        self.projection = nn.Conv1d(in_channels * 4, in_channels, kernel_size, padding='same')
-        self.output_layer_norm = nn.GroupNorm(1, in_channels, eps=1e-08)
-
-        self.audio_encoder = nn.ModuleList()
-        self.spike_encoder = nn.ModuleList()
-        self.audio_layer_norm_list = nn.ModuleList()
-        self.spike_layer_norm_list = nn.ModuleList()
+        self.voice_attns = nn.ModuleList([ConvCrossAttention(out_channels) for _ in range(num_layers)])
+        self.EEG_attns = nn.ModuleList([ConvCrossAttention(out_channels) for _ in range(num_layers)])
+        self.voice_norms = nn.ModuleList([
+            nn.GroupNorm(1, out_channels, 1e-8) for _ in range(num_layers)])
+        self.EEG_norms = nn.ModuleList([
+            nn.GroupNorm(1, out_channels, 1e-8) for _ in range(num_layers)])
         
-        for i in range(num_layers):
-            self.audio_layer_norm_list.append(nn.GroupNorm(1, in_channels, eps=1e-08))
-            self.spike_layer_norm_list.append(nn.GroupNorm(1, in_channels, eps=1e-08))
-        for i in range(num_layers):
-            self.audio_encoder.append(ConvCrossAttention(n_head, in_channels, kernel_size, 
-                                                         dilation))
-            self.spike_encoder.append(ConvCrossAttention(n_head, in_channels, kernel_size, 
-                                                         dilation))
+        self.projection = nn.Sequential(
+            nn.Conv1d(out_channels*4, out_channels, 3, padding=1),
+            nn.GroupNorm(1, out_channels, 1e-8)
+        )
 
-    def forward(self, audio, spike):
-        out_audio = audio
-        out_spike = spike
+    def forward(self, voice, EEG_cue):
+        # voice: [B, C, T]
+        # EEG_cue: [B, C, T]
 
-        skip_audio = 0.
-        skip_spike = 0.
-        residual_audio = audio
-        residual_spike = spike
+        residual_cue = torch.clone(EEG_cue)
+        residual_voice = torch.clone(voice)
+
         for i in range(self.num_layers):
-            out_audio = self.audio_encoder[i](out_spike, out_audio, out_audio)
-            out_spike = self.spike_encoder[i](out_audio, out_spike, out_spike)
-            out_audio = out_audio + residual_audio
-            out_audio = self.audio_layer_norm_list[i](out_audio)
-            out_spike = out_spike + residual_spike
-            out_spike = self.spike_layer_norm_list[i](out_spike)
-            residual_audio = out_audio
-            residual_spike = out_spike
-            skip_audio += out_audio
-            skip_spike += out_spike
-        out = torch.cat((skip_audio, audio, out_spike, spike), dim=1)
-        out = self.projection(out)
-        out = self.output_layer_norm(out)
-        return out        
+            mid_feat = self.voice_attns[i](EEG_cue, voice)
+            # mid_feat: [B, C, T]
+            EEG_cue = self.EEG_norms[i](self.EEG_attns[i](voice, EEG_cue) + EEG_cue)
+            # EEG_cue: [B, C, T]
+            voice = self.voice_norms[i](mid_feat + voice)
+            # voice: [B, C, T]
+
+            if i == 0:
+                skip_voice = voice
+                skip_cue = EEG_cue
+            else:
+                skip_voice = skip_voice + voice
+                skip_cue = skip_cue + EEG_cue
+
+        output = torch.concat([skip_voice, residual_voice, EEG_cue, residual_cue], 1)
+        # output: [B, C*4, T]
+        output = self.projection(output)
+        # output: [B, C, T]
+
+        return output       
 
 class Dual_RNN_Block(nn.Module):
-    def __init__(self, out_channels,
-                 hidden_channels, rnn_type='LSTM', norm='ln',
-                 dropout=0, bidirectional=False, num_spks=2):
+    def __init__(self, out_channels, rnn_type='LSTM'):
         super(Dual_RNN_Block, self).__init__()
+
         # RNN model
         self.intra_rnn = getattr(nn, rnn_type)(
-            out_channels, hidden_channels, 1, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+            out_channels, out_channels, 1, batch_first=True, dropout=0.1, bidirectional=True)
         self.inter_rnn = getattr(nn, rnn_type)(
-            out_channels, hidden_channels, 1, batch_first=True, dropout=dropout, bidirectional=bidirectional)
-        # Norm
-        # self.intra_norm = select_norm(norm, out_channels, 4)
-        # self.inter_norm = select_norm(norm, out_channels, 4)
+            out_channels, out_channels, 1, batch_first=True, dropout=0.1, bidirectional=True)
+        
+        # Normalization
         self.intra_norm = nn.GroupNorm(1, out_channels, eps=1e-8)
         self.inter_norm = nn.GroupNorm(1, out_channels, eps=1e-8)
 
         # Linear
-        self.intra_linear = nn.Linear(
-            hidden_channels*2 if bidirectional else hidden_channels, out_channels)
-        self.inter_linear = nn.Linear(
-            hidden_channels*2 if bidirectional else hidden_channels, out_channels)
-        
-
+        self.intra_linear = nn.Linear(out_channels*2, out_channels)
+        self.inter_linear = nn.Linear(out_channels*2, out_channels)
+    
     def forward(self, x):
-        '''
-           x: [B, N, K, S]
-           out: [Spks, B, N, K, S]
-        '''
-        B, N, K, S = x.shape
+        # x: [B, C, K, S]
+
+        B, C, K, S = x.shape
+
         # intra RNN
-        # [BS, K, N]
-        intra_rnn = x.permute(0, 3, 2, 1).contiguous().view(B*S, K, N)
-        # [BS, K, H]
-        intra_rnn, _ = self.intra_rnn(intra_rnn)
-        # [BS, K, N]
-        intra_rnn = self.intra_linear(intra_rnn.contiguous().view(B*S*K, -1)).view(B*S, K, -1)
-        # [B, S, K, N]
-        intra_rnn = intra_rnn.view(B, S, K, N)
-        # [B, N, K, S]
-        intra_rnn = intra_rnn.permute(0, 3, 2, 1).contiguous()
-        intra_rnn = self.intra_norm(intra_rnn)
         
-        # [B, N, K, S]
+        intra_rnn = x.permute(0, 3, 2, 1).contiguous().view(B*S, K, C)
+        # [B*S, K, C]
+        intra_rnn, _ = self.intra_rnn(intra_rnn)
+        # [B*S, K, H]
+        intra_rnn = self.intra_linear(intra_rnn.contiguous().view(B*S*K, -1)).view(B*S, K, -1)
+        # [B*S, K, C]
+        intra_rnn = intra_rnn.view(B, S, K, C)
+        # [B, S, K, C]
+        intra_rnn = intra_rnn.permute(0, 3, 2, 1).contiguous()
+        # [B, C, K, S]
+        intra_rnn = self.intra_norm(intra_rnn)
+        # [B, C, K, S]
         intra_rnn = intra_rnn + x
 
         # inter RNN
-        # [BK, S, N]
-        inter_rnn = intra_rnn.permute(0, 2, 3, 1).contiguous().view(B*K, S, N)
-        # [BK, S, H]
+        
+        inter_rnn = intra_rnn.permute(0, 2, 3, 1).contiguous().view(B*K, S, C)
+        # [B*K, S, C]
         inter_rnn, _ = self.inter_rnn(inter_rnn)
-        # [BK, S, N]
+        # [B*K, S, C*2]
         inter_rnn = self.inter_linear(inter_rnn.contiguous().view(B*S*K, -1)).view(B*K, S, -1)
-        # [B, K, S, N]
-        inter_rnn = inter_rnn.view(B, K, S, N)
-        # [B, N, K, S]
+        # [B*K, S, C]
+        inter_rnn = inter_rnn.view(B, K, S, C)
+        # [B, K, S, C]
         inter_rnn = inter_rnn.permute(0, 3, 1, 2).contiguous()
+        # [B, C, K, S]
         inter_rnn = self.inter_norm(inter_rnn)
-        # [B, N, K, S]
+        # [B, C, K, S]
         out = inter_rnn + intra_rnn
 
         return out
 
 
 class DPRNN(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, CMCA_kernel=3, rnn_type='LSTM', norm='ln', K=250, 
-                 dropout_rate=0.1, bidirectional=True, CMCA_layer_num=3, CMCA_n_head=1):
+    def __init__(self, out_channels=128, hidden_channels=128, num_layers={"main": 4, "fusion": 3}, rnn_type='LSTM', K=250):
         super(DPRNN, self).__init__()
         
         self.K = K
         self.num_layers = num_layers
 
         self.bottleneck = nn.Sequential(
-            nn.GroupNorm(1, input_dim, 1e-8),
-            nn.Conv1d(input_dim, hidden_dim, 1, bias=False)
+            nn.GroupNorm(1, out_channels*2, 1e-8),
+            nn.Conv1d(out_channels*2, hidden_channels, 1, bias=False)
         )
-        self.fusion = MultiLayerCrossAttention(CMCA_layer_num, hidden_dim, CMCA_kernel, 
-                                               1, CMCA_n_head)
+        self.fusion = MultiLayerCrossAttention(num_layers["fusion"], out_channels=hidden_channels)
+        self.DPRNN= nn.ModuleList([
+            Dual_RNN_Block(hidden_channels, rnn_type) for _ in range(self.num_layers)])
+        self.output_layer = nn.Sequential(
+            nn.PReLU(),
+            nn.Conv1d(hidden_channels, out_channels, 1, bias=False),
+            nn.PReLU()
+        )
         
-        self.DPRNN= nn.ModuleList([])
-        for _ in range(self.num_layers):
-            self.DPRNN.append(Dual_RNN_Block(hidden_dim, hidden_dim, 
-                                             rnn_type, norm, dropout_rate, bidirectional))
-                    
-        self.prelu = nn.PReLU()
-        self.end_conv = nn.Conv1d(hidden_dim, output_dim, 1, bias=False)
-        self.activation = nn.ReLU()    
-        
-    def forward(self, input, spike):
-        # input: [B, 256, 7298]
-        # spike: [B, 128, 7298]
-        input = self.bottleneck(input)
-        # input: [B, 128, 7298]  
-        input = self.fusion(input, spike)
-        # input: [B, 128, 7298]
+    def forward(self, voice, EEG_cue):
+        # voice: [B, C*2, T]
+        # EEG_cue: [B, C, T]
 
-        audio, gap = self._Segmentation(input, self.K)
+        voice = self.bottleneck(voice)
+        # voice: [B, C, T]  
+        voice = self.fusion(voice, EEG_cue)
+        # input: [B, C, T]
 
-        for i in range(self.num_layers):
-            audio = self.DPRNN[i](audio)
+        voice, gap = _Segmentation(voice, self.K)
+        # voice: [B, C, K, S]
+
+        for i in range(self.num_layers["main"]):
+            voice = self.DPRNN[i](voice)
         
-        B, _, K, S = audio.shape
-        audio = audio.view(B,-1, K, S)
-        
-        output = self._over_add(audio, gap)    
-        output = self.prelu(output)
-        output = self.end_conv(output)
-        output = self.activation(output)
+        output = _over_add(voice, gap)
+        # output: [B, C, T]
+        output = self.output_layer(output)
+        # output: [B, C, T]
 
         return output
-    
-    def _padding(self, input, K):
-        '''
-           padding the audio times
-           K: chunks of length
-           P: hop size
-           input: [B, N, L]
-        '''
-        B, N, L = input.shape
-        P = K // 2
-        gap = K - (P + L % K) % K
-        if gap > 0:
-            pad = torch.Tensor(torch.zeros(B, N, gap)).type(input.type())
-            input = torch.cat([input, pad], dim=2)
-
-        _pad = torch.Tensor(torch.zeros(B, N, P)).type(input.type())
-        input = torch.cat([_pad, input, _pad], dim=2)
-
-        return input, gap
-
-    def _Segmentation(self, input, K):
-        '''
-           the segmentation stage splits
-           K: chunks of length
-           P: hop size
-           input: [B, N, L]
-           output: [B, N, K, S]
-        '''
-        B, N, L = input.shape
-        P = K // 2
-        input, gap = self._padding(input, K)
-        # [B, N, K, S]
-        input1 = input[:, :, :-P].contiguous().view(B, N, -1, K)
-        input2 = input[:, :, P:].contiguous().view(B, N, -1, K)
-        input = torch.cat([input1, input2], dim=3).view(
-            B, N, -1, K).transpose(2, 3)
-
-        return input.contiguous(), gap
-
-    def _over_add(self, input, gap):
-        '''
-           Merge sequence
-           input: [B, N, K, S]
-           gap: padding length
-           output: [B, N, L]
-        '''
-        B, N, K, S = input.shape
-        P = K // 2
-        # [B, N, S, K]
-        input = input.transpose(2, 3).contiguous().view(B, N, -1, K * 2)
-
-        input1 = input[:, :, :, :K].contiguous().view(B, N, -1)[:, :, P:]
-        input2 = input[:, :, :, K:].contiguous().view(B, N, -1)[:, :, :-P]
-        input = input1 + input2
-        # [B, N, L]
-        if gap > 0:
-            input = input[:, :, :-gap]
-
-        return input
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, out_channels, kernel_size, stride):
+    def __init__(self, out_channels=128, kernel_size=8, stride=4):
         super(AudioEncoder, self).__init__()
 
         self.encoder1 = nn.Sequential(
