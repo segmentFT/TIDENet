@@ -9,23 +9,20 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-
 import random
 
-random.seed(100)
-torch.manual_seed(100)
-np.random.seed(100)
+random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+np.random.seed(42)
 
 from distributed import init_distributed, apply_gradient_allreduce, reduce_tensor
-
 from dataset import load_CleanNoisyPairDataset
 from sisdr_loss import si_sidrloss
 from util import rescale, find_max_epoch, print_size
 from util import LinearWarmupCosineDecay, loss_fn
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from BASEN import BASEN
-#from torchinfo import summary
-
+from utility.models import TIDENet as BASEN
 
 def val(dataloader, model, loss_fn):
 
@@ -42,9 +39,14 @@ def val(dataloader, model, loss_fn):
     print(f"Val Avg loss: {test_loss:>8f} \n")
     return test_loss
 
+def train(num_gpus, rank, group_name, exp_path, log, optimization):
+    # set seeds
+    random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    np.random.seed(42)
 
-def train(num_gpus, rank, group_name,
-          exp_path, log, optimization):
     # setup local experiment path
     if rank == 0:
         print('exp_path:', exp_path)
@@ -67,24 +69,14 @@ def train(num_gpus, rank, group_name,
         print("ckpt_directory: ", ckpt_directory, flush=True)
 
     # load training data
-    trainloader = load_CleanNoisyPairDataset(**trainset_config,
-                                             subset='train',
-                                             batch_size=optimization["batch_size_per_gpu"],
-                                             num_gpus=num_gpus)
-    valloader = load_CleanNoisyPairDataset(**trainset_config,
-                                             subset='val',
-                                             batch_size=optimization["batch_size_per_gpu"],
-                                             num_gpus=num_gpus)
+    trainloader = load_CleanNoisyPairDataset(trainset_config["root"], 'train', 
+                                             optimization["batch_size_per_gpu"], num_gpus)
+    valloader = load_CleanNoisyPairDataset(trainset_config["root"], 'val', 
+                                           optimization["batch_size_per_gpu"], num_gpus)
     print('Data loaded')
 
     # predefine model
-    net = BASEN(network_config["enc_channel"], network_config["k_adj"], 
-                network_config["enc_channel"], network_config["feature_channel"], 
-                network_config["kernel_size"], network_config["num_layers"], network_config["rnn_type"], 
-                network_config["norm"], network_config["K"],  network_config["dropout_rate"], 
-                network_config["bidirectional"], network_config["CMCA_kernel"], 
-                network_config["CMCA_layer_num"], network_config["CMCA_n_head"]).cuda()
-
+    net = BASEN().cuda()
     print_size(net)
 
     # apply gradient all reduce
@@ -93,7 +85,6 @@ def train(num_gpus, rank, group_name,
 
     # define optimizer
     optimizer = torch.optim.Adam(net.parameters(), lr=optimization["learning_rate"], weight_decay=1e-3)
-    # optimizer = torch.optim.Adam(net.parameters(), lr=optimization["learning_rate"])
 
     # load checkpoint
     time0 = time.time()
@@ -128,7 +119,7 @@ def train(num_gpus, rank, group_name,
 
     # define learning rate scheduler
     scheduler = LinearWarmupCosineDecay(
-        optimizer,
+        optimizer=optimizer,
         lr_max=optimization["learning_rate"],
         n_iter=optimization["n_iter_per_cycle"],
         iteration=n_iter,

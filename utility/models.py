@@ -1,8 +1,8 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
-from utility.layers import GraphConvolution
-from utility.utils import normalize_A, generate_cheby_adj, ChannelwiseLayerNorm, ResBlock
+import torch.nn.functional as F
 
 
 def _padding(input, K):
@@ -221,23 +221,250 @@ class Dual_RNN_Block(nn.Module):
         return out
 
 
-class DPRNN(nn.Module):
-    def __init__(self, out_channels=128, hidden_channels=128, num_layers={"main": 4, "fusion": 3}, rnn_type='LSTM', K=250):
-        super(DPRNN, self).__init__()
+class VoiceEncoder(nn.Module):
+    def __init__(self, out_channels=128, kernel_size=8, stride=4):
+        super(VoiceEncoder, self).__init__()
+
+        self.encoder1 = nn.Sequential(
+            nn.Conv1d(1, out_channels, kernel_size, stride=stride),
+            nn.PReLU()
+        )
+
+        self.encoder2 = nn.Sequential(
+            nn.Conv1d(1, out_channels, kernel_size, stride=stride),
+            nn.PReLU()
+        )
+
+    def forward(self, x):
+        # x: [B, 1, L]
+
+        x1 = self.encoder1(x)
+        # x1: [B, C, T]
+        x2 = self.encoder2(x)
+        # x2: [B, C, T]
+
+        return x1, x2
+
+
+class EEGEncoder(nn.Module):
+    def __init__(self, num_electrodes=128, num_adjacents=3, out_channels=128, kernel_size=8):
+        super(EEGEncoder, self).__init__()
+
+        class Chebynet(nn.Module):
+            def __init__(self):
+                super(Chebynet, self).__init__()
+
+                class GraphConvolution(nn.Module):
+                    def __init__(self):
+                        super(GraphConvolution, self).__init__()
+
+                        self.weight = nn.Parameter(torch.FloatTensor(num_electrodes, num_electrodes))
+                        nn.init.xavier_normal_(self.weight)
+
+                    def forward(self, x, adjacent_matrix):
+                        # x: [B, Ce, Le]
+                        # adjacent_matrix: [Ce, Ce]
+
+                        output = torch.matmul(self.weight, torch.matmul(adjacent_matrix, x))
+                        # output: [B, Ce, Le]
+                        
+                        return output
+
+                self.graph_convs = nn.ModuleList([GraphConvolution() for _ in range(num_adjacents)])
+
+            def generate_cheby_adj(self, laplacian_matrix):
+                # laplacian_matrix: [Ce, Ce]
+
+                support = []
+                for i in range(num_adjacents):
+                    if i == 0:
+                        support.append(torch.eye(laplacian_matrix.size(-1)).cuda())
+                    elif i == 1:
+                        support.append(laplacian_matrix)
+                    else:
+                        temp = torch.matmul(2*laplacian_matrix, support[-1]) - support[-2]
+                        support.append(temp)
+                
+                return support
+
+            def forward(self, x, laplacian_matrix):
+                # x: [B, Ce, Le]
+                # laplacian_matrix: [Ce, Ce]
+        
+                adjacent_matrices = self.generate_cheby_adj(laplacian_matrix)
+
+                for i in range(num_adjacents):
+                    if i == 0:
+                        result = self.graph_convs[i](x, adjacent_matrices[i])
+                    else:
+                        result = result + self.graph_convs[i](x, adjacent_matrices[i])
+                
+                result = F.relu(result)
+
+                return result
+            
+        class EncoderBranch(nn.Module):
+            def __init__(self):
+                super(EncoderBranch, self).__init__()
+
+                class ResBlock(nn.Module):
+                    def __init__(self, in_dims, out_dims):
+                        super(ResBlock, self).__init__()
+
+                        self.operations = nn.Sequential(
+                            nn.Conv1d(in_dims, out_dims, 3, padding=1, bias=False),
+                            nn.BatchNorm1d(out_dims),
+                            nn.PReLU(),
+                            nn.Conv1d(out_dims, out_dims, 3, padding=1, bias=False),
+                            nn.BatchNorm1d(out_dims)
+                        )
+                        self.prelu = nn.PReLU()
+
+                        if in_dims != out_dims:
+                            self.downsample = True
+                            self.conv_downsample = nn.Conv1d(in_dims, out_dims, 1, bias=False)
+                        else:
+                            self.downsample = False
+
+                    def forward(self, x):
+                        # x: [B, C1, T]
+
+                        y = self.operations(x)
+                        # y: [B, C2, T]
+
+                        if self.downsample:
+                            y += self.conv_downsample(x)
+                        else:
+                            y += x
+                        
+                        return self.prelu(y)
+
+                self.batch_norm1 = nn.BatchNorm1d(256)
+                self.batch_norm2 = nn.BatchNorm1d(29184)
+                self.GCN_layer1 = Chebynet()
+                self.GCN_layer2 = Chebynet()
+                
+                self.A1 = nn.Parameter(torch.FloatTensor(num_electrodes, num_electrodes).cuda())
+                self.A2 = nn.Parameter(torch.FloatTensor(num_electrodes , num_electrodes).cuda())
+                nn.init.xavier_normal_(self.A1)
+                nn.init.xavier_normal_(self.A2)
+
+                self.up_sampler = nn.ConvTranspose1d(num_electrodes, num_electrodes, 369, 
+                                                     113, groups=num_electrodes, bias=False)
+
+                self.projection = nn.Conv1d(num_electrodes, out_channels//2, kernel_size, 
+                                            kernel_size//2, bias=False)
+                self.layer_norm = nn.LayerNorm(out_channels//2)
+                self.encoder = nn.Sequential(
+                    nn.Conv1d(out_channels//2, out_channels//2, 1),
+                    ResBlock(out_channels//2, out_channels//2),
+                    ResBlock(out_channels//2, out_channels),
+                    ResBlock(out_channels,out_channels),
+                    nn.Conv1d(out_channels, out_channels//2, 1),
+                )
+
+            def normalize_A(self, A):
+                # A: [Ce, Ce]
+
+                ones = torch.ones(num_electrodes, num_electrodes).cuda()
+                # ones: [Ce, Ce]
+                diag = torch.eye(num_electrodes, num_electrodes).cuda()
+                # diag: [Ce, Ce]
+
+                A = F.relu(A)
+                A = A * (ones - diag)
+                A = A + A.T
+
+                degree_matrix = A.sum(-1)
+                # degree_matrix: [Ce]
+                degree_matrix = 1 / torch.sqrt((degree_matrix + 1e-10))
+                # degree_matrix: [Ce]
+                degree_matrix = torch.diag_embed(degree_matrix)
+                # degree_matrix: [Ce, Ce]
+                laplacian_matrix = diag - torch.matmul(torch.matmul(degree_matrix, A), degree_matrix)
+                # laplacian_matrix: [Ce, Ce]
+                L_norm = laplacian_matrix - diag
+                # L_norm: [Ce, Ce]
+
+                return L_norm
+
+            def forward(self, x):
+                # spike: [B, C3, 256]
+
+                x = torch.transpose(x, -2, -1)
+                # x: [B, 256, Ce]
+                x = self.batch_norm1(x)
+                # x: [B, 256, Ce]
+                x = torch.transpose(x, -2, -1)
+                # x: [B, Ce, 256]
+                x = self.GCN_layer1(x, self.normalize_A(self.A1))
+                # x: [B, Ce, 256]
+
+                x = self.up_sampler(x)
+                # x: [B, Ce, 29184]
+
+                x = torch.transpose(x, -2, -1)
+                # x: [B, 29184, Ce]
+                x = self.batch_norm2(x)
+                # x: [B, Ce, 29184]
+                x = torch.transpose(x, -2, -1)
+                # x: [B, 29184, Ce]
+                x = self.GCN_layer2(x, self.normalize_A(self.A2))
+                # spike: [B, Ce, 29184]
+        
+                x = self.projection(x)
+                # x: [B, C/2, T]
+                x = torch.transpose(x, -2, -1)
+                # x: [B, T, C/2]
+                x = self.layer_norm(x)
+                # x: [B, T, C/2]
+                x = torch.transpose(x, -2, -1)
+                # x: [B, C/2, T]
+                x = self.encoder(x)
+                # x: [B, C/2, T]
+
+                return x
+            
+        self.encoder_branch1 = EncoderBranch()
+        self.encoder_branch2 = EncoderBranch()
+        self.integration = nn.Sequential(
+            nn.Conv1d(out_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(1, out_channels, 1e-8),
+            nn.PReLU()
+        )
+
+    def forward(self, x):
+        # x: [B, 128, 256]
+
+        x1 = self.encoder_branch1(x)
+        # x1: [B, C/2, T]
+        x2 = self.encoder_branch2(x)
+        # x2: [B, C/2, T]
+        x = self.integration(torch.concat([x1, x2], 1))
+        # x: [B, C, T]
+
+        return x
+
+
+class Separator(nn.Module):
+    def __init__(self, in_channels=256, out_channels=128, rnn_type='LSTM', K=250, num_layers={"main": 4, "fusion": 3}, ):
+        super(Separator, self).__init__()
         
         self.K = K
         self.num_layers = num_layers
 
         self.bottleneck = nn.Sequential(
-            nn.GroupNorm(1, out_channels*2, 1e-8),
-            nn.Conv1d(out_channels*2, hidden_channels, 1, bias=False)
+            nn.GroupNorm(1, in_channels, 1e-8),
+            nn.Conv1d(in_channels, out_channels, 1, bias=False)
         )
-        self.fusion = MultiLayerCrossAttention(num_layers["fusion"], out_channels=hidden_channels)
+        self.fusion = MultiLayerCrossAttention(num_layers["fusion"], out_channels=out_channels)
+
         self.DPRNN= nn.ModuleList([
-            Dual_RNN_Block(hidden_channels, rnn_type) for _ in range(self.num_layers)])
+            Dual_RNN_Block(out_channels, rnn_type) for _ in range(self.num_layers["main"])])
+        
         self.output_layer = nn.Sequential(
             nn.PReLU(),
-            nn.Conv1d(hidden_channels, out_channels, 1, bias=False),
+            nn.Conv1d(out_channels, out_channels, 1, bias=False),
             nn.PReLU()
         )
         
@@ -264,121 +491,75 @@ class DPRNN(nn.Module):
         return output
 
 
-class AudioEncoder(nn.Module):
-    def __init__(self, out_channels=128, kernel_size=8, stride=4):
-        super(AudioEncoder, self).__init__()
+class TIDENet(nn.Module):
+    def __init__(self, num_electrodes=128, num_adjacents=3, out_channels=128, kernel_size=8, num_layers={"main": 4, "fusion": 3}, 
+                 rnn_type='LSTM', K=250):
+        super(TIDENet, self).__init__()
 
-        self.encoder1 = nn.Sequential(
-            nn.Conv1d(1, out_channels, kernel_size, 
-                      stride),
-            nn.PReLU()
+        self.EEG_encoder = EEGEncoder(num_electrodes, num_adjacents, out_channels, 
+                                        kernel_size)
+        self.voice_encoder = VoiceEncoder(out_channels, kernel_size, kernel_size//2)
+
+        self.projection = nn.Sequential(
+            nn.LayerNorm(out_channels),
+            nn.Linear(out_channels, out_channels)
         )
-
-        self.encoder2 = nn.Sequential(
-            nn.Conv1d(1, out_channels, kernel_size, 
-                      stride),
-            nn.PReLU()
-        )
-
-    def forward(self, x):
-        # x: [B, 1, L]
-
-        x1 = self.encoder1(x)
-        # x1: [B, C, T]
-        x2 = self.encoder2(x)
-        # x2: [B, C, T]
-
-        return x1, x2
-
-class EEGEncoder(nn.Module):
-    def __init__(self, num_electrodes, k_adj, enc_channel, feature_channel, kernel_size):
-        super(EEGEncoder, self).__init__()
-
-        class Chebynet(nn.Module):
-            def __init__(self):
-                super(Chebynet, self).__init__()
-
-                self.K = k_adj
-                self.gc = nn.ModuleList()
-                for i in range(k_adj):
-                    self.gc.append(GraphConvolution(num_electrodes, num_electrodes))
-
-            def forward(self, x ,L):
         
-                adj = generate_cheby_adj(L, self.K)
+        self.mask_net = Separator(out_channels*2, out_channels, rnn_type, K, 
+                                  num_layers)
 
-                for i in range(len(self.gc)):
-                    if i == 0:
-                        result = self.gc[i](x, adj[i])
-                    else:
-                        result += self.gc[i](x, adj[i])
-                result = nn.functional.relu(result)
-
-                return result
-            
-        class EncoderBranch(nn.Module):
-            def __init__(self):
-                super(EncoderBranch, self).__init__()
-
-                self.batch_norm1 = nn.BatchNorm1d(256)
-                self.batch_norm2 = nn.BatchNorm1d(29196)
-                self.GCN_layer1 = Chebynet()
-                self.GCN_layer2 = Chebynet()
-                self.projection = nn.Conv1d(num_electrodes, feature_channel, kernel_size, 
-                                            kernel_size // 2, bias=False)
-                self.A1 = nn.Parameter(torch.FloatTensor(num_electrodes, num_electrodes).cuda())
-                self.A2 = nn.Parameter(torch.FloatTensor(num_electrodes , num_electrodes).cuda())
-                nn.init.xavier_normal_(self.A1)
-                nn.init.xavier_normal_(self.A2)
-
-                self.up_sampler = nn.ConvTranspose1d(num_electrodes, num_electrodes, 381, 
-                                                     113, groups=num_electrodes, bias=False)
-
-                self.encoder = nn.Sequential(
-                    ChannelwiseLayerNorm(feature_channel),
-                    nn.Conv1d(feature_channel, feature_channel, 1),
-                    ResBlock(feature_channel, feature_channel),
-                    ResBlock(feature_channel, enc_channel),
-                    ResBlock(enc_channel,enc_channel),
-                    nn.Conv1d(enc_channel, feature_channel, 1),
-                )
-
-            def forward(self, spike):
-                # spike: [B, 128, 256]
-
-                spike = self.batch_norm1(spike.transpose(1, 2)).transpose(1, 2)
-                spike = self.GCN_layer1(spike, normalize_A(self.A1))
-                # spike: [B, 128, 256]
-
-                spike = self.up_sampler(spike)
-                # spike: [B, 128, 29196]
-
-                spike = self.batch_norm2(spike.transpose(1, 2)).transpose(1, 2)
-                spike = self.GCN_layer2(spike, normalize_A(self.A2))
-                # spike: [B, 128, 29196]
+        self.decoder = nn.ConvTranspose1d(out_channels, 1, kernel_size, 
+                                          kernel_size // 2, bias=False)
         
-                spike = self.projection(spike)
-                spike = self.encoder(spike)
-                # spike: [B, 64, 7298]
+    def forward(self, voice, raw_EEG):
+        # voice: [B, 1, 29184]
+        # raw_EEG: [B, Ce, 256]
 
-                return spike
-            
-        self.encoder_branch1 = EncoderBranch()
-        self.encoder_branch2 = EncoderBranch()
-        self.integration = nn.Sequential(
-            nn.Conv1d(enc_channel, enc_channel, 1, bias=False),
-            nn.GroupNorm(1, enc_channel, 1e-8),
-            nn.PReLU()
-        )
+        raw_EEG = self.EEG_encoder(raw_EEG)
+        # spike_input: [B, C, T]
+        voice1, voice2 = self.voice_encoder(voice)
+        # voice1: [B, C, T]
+        # voice2: [B, C, T]
 
-    def forward(self, x):
-        # x: [B, 128, 256]
+        voice = torch.concat([voice1, voice2], 1)
+        # voice: [B, C*2, T]
+        mask = F.sigmoid(self.mask_net(voice, raw_EEG))
+        # mask: [B, C, T]
 
-        x1 = self.encoder_branch1(x)
-        # x1: [B, 64, 7298]
-        x2 = self.encoder_branch2(x)
-        # x2: [B, 64, 7298]
-        x = self.integration(torch.concat([x1, x2], 1))
-        # x: [B, 128, 7298]
+        voice1 = torch.transpose(voice1, -2, -1)
+        # voice1: [B, T, C]
+        voice1 = self.projection(voice1)
+        # voice1: [B, T, C]
+        voice1 = torch.transpose(voice1, -2, -1)
+        # voice1: [B, C, T]
 
-        return x
+        mask = mask.transpose(-2, -1)
+        # mask: [B, T, C]
+        mask = self.projection(mask)
+        # mask: [B, T, C]
+        mask = torch.transpose(mask, -2, -1)
+        # mask: [B, C, T]
+        
+        output = self.decoder(voice1 * mask)
+        # output: [B, 1, 29184]
+        
+        return output
+
+
+def test():
+    x = torch.randn(2, 1, 29184).cuda()
+    y = torch.randn(2, 128, 256).cuda()
+    net = TIDENet().cuda()
+
+    z = net(x, y)
+    print(z.shape)
+
+    for name, param in net.named_parameters():
+        print(f"{name}: {param.shape}")
+
+    params = filter(lambda p: p.requires_grad, net.parameters())
+    num_params = np.sum([np.prod(p.shape) for p in params]) / 1e6
+    print(num_params)
+
+if __name__ == "__main__":
+    test()

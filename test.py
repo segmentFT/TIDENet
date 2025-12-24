@@ -1,5 +1,7 @@
 import os, sys, shutil, json, time
+
 os.environ['CUDA_VISIBLE_DEVICES'] = "0"
+sys.path.append('../')
 
 import argparse
 from tqdm import tqdm
@@ -7,23 +9,13 @@ import torch
 from dataset import cock_tail
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-sys.path.append('../')
-import matplotlib.font_manager
-from BASEN import BASEN
+from utility.models import TIDENet as BASEN
 import pandas as pd
-from tools.VeryCustomSacred import CustomExperiment, ChooseGPU
-from tools.utilities import timeStructured
-
-from tools.plotting import save_wav, evaluations_to_violins, one_plot_test
-
+from tools.VeryCustomSacred import CustomExperiment
+from tools.plotting import evaluations_to_violins, one_plot_test
 from tools.calculate_intelligibility import find_intel
-
-
 import pickle
 import numpy as np
-
-
-from tools.utilities import setReproducible
 
 FILENAME = os.path.realpath(__file__)
 CDIR = os.path.dirname(FILENAME)
@@ -189,14 +181,3 @@ def test(model_path, dataset_root):
                                       generator_type + '')
 
     shutil.make_archive(ex.observers[0].basedir, 'zip', exp_dir)
-
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('-c', '--config', type=str, default='configs/experiments.json',
-#                         help='JSON file for configuration')
-#     args = parser.parse_args()
-#     with open(args.config) as f:
-#         data = f.read()
-#     config = json.loads(data)
-#     test(model_path=config["test"]["model_path"],
-#                    dataset_root=config["test"]["dataset_root"])

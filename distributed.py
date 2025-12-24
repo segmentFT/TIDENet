@@ -37,6 +37,11 @@ import argparse
 import warnings
 warnings.filterwarnings("ignore")
 import torch
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
 import torch.distributed as dist
 from torch.autograd import Variable
 
