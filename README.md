@@ -212,21 +212,17 @@ Test results are saved automatically in the ```experiments/``` directory located
 
 ```
 └─experiments
-    ├─Behavioural Data
-    ├─EEG
-    ├─yyyy-mm-dd-hh-mm-ss--xxxx-mc_test_
-    │  ├─images
-    │  ├─other_outputs
-    │  │  ├─...
-    │  │  │
-    │  │  └─evaluation_sNone_gtest.csv
-    │  │  
-    │  ├─1
-    │  ├─text
-    |  └─trained_models
-    |
-    ├─preprocessed_EEG
-    └─Stimuli
+    │
+    └─yyyy-mm-dd-hh-mm-ss--xxxx-mc_test_
+       ├─images
+       ├─other_outputs
+       │  ├─...
+       │  │
+       │  └─evaluation_sNone_gtest.csv
+       │  
+       ├─1
+       ├─text
+       └─trained_models
 ```
 
 ### Performance of TIDENet
